@@ -44,8 +44,11 @@
 
           socket :: port() | undefined,
           parser_state :: #pstate{} | undefined,
-          queue :: eredis_queue() | undefined
+          queue :: eredis_queue() | undefined,
+          request_queue_check_timeref :: reference() | undefined
 }).
+
+-define(REQUEST_QUEUE_TIMEOUT, 10000).
 
 %%
 %% API
@@ -171,6 +174,29 @@ handle_info(initiate_connection, #state{socket = undefined} = State) ->
             maybe_reconnect(Reason, State)
     end;
 
+handle_info({timeout, Ref, {request_queue_check, From}},
+        #state{request_queue_check_timeref = NowRef,
+               queue = Queue,
+               socket = Socket}=State) ->
+    case NowRef == Ref of
+        true ->
+            case queue:peek(Queue) of
+                {value, Item} ->
+                    case receipient(Item) == From of
+                        true ->
+                            spawn(fun()->gen_tcp:close(Socket) end),
+                            self() ! {tcp_closed, Socket};
+                        false ->
+                            skip
+                    end;
+                _ ->
+                    skip
+            end,
+            {noreply, State#state{request_queue_check_timeref = undefined}};
+        false ->
+            {noreply, State}
+    end;
+
 handle_info(_Info, State) ->
     {stop, {unhandled_message, _Info}, State}.
 
@@ -194,7 +220,17 @@ code_change(_OldVsn, State, _Extra) ->
 %% connection, returns error.
 do_request(_Req, _From, #state{socket = undefined} = State) ->
     {reply, {error, no_connection}, State};
-
+do_request(Req, From, #state{request_queue_check_timeref = undefined}=State) ->
+    case gen_tcp:send(State#state.socket, Req) of
+        ok ->
+            NewQueue = queue:in({1, From}, State#state.queue),
+            {value, Item} = queue:peek(NewQueue),
+            CheckFrom = receipient(Item),
+            TimerRef = erlang:start_timer(?REQUEST_QUEUE_TIMEOUT, self(), {request_queue_check, CheckFrom}),
+            {noreply, State#state{queue = NewQueue, request_queue_check_timeref = TimerRef}};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
 do_request(Req, From, State) ->
     case gen_tcp:send(State#state.socket, Req) of
         ok ->
